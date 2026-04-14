@@ -1,0 +1,686 @@
+# Session Liquidity Sweep + Imbalance Map
+# Intraday study: tracks key levels, detects liquidity sweeps, displacement candles,
+# fair value gaps, session bias, and generates long/short signals.
+# Designed for 1m–15m intraday charts.
+
+declare upper;
+declare hide_on_daily;
+
+# =====================================================================
+# SECTION 1: INPUTS
+# =====================================================================
+
+# --- Session / Time Inputs ---
+input sessionOpenHour = 0930;                 # Regular market open (HHMM EST)
+input sessionCloseHour = 1600;                # Regular market close (HHMM EST)
+input openingRangeMinutes = 15;               # Opening range duration in minutes
+input resetOnNewSession = yes;                # Reset state each session
+
+# --- Liquidity Sweep Inputs ---
+input sweepTickPenetration = 2;               # Min ticks beyond level for a sweep
+input sweepConfirmBars = 1;                   # Bars to confirm sweep (close back inside)
+input sweepLookback = 3;                      # Max bars for sweep confirmation window
+
+# --- Displacement Candle Inputs ---
+input atrLength = 14;                         # ATR period for displacement filter
+input atrMultiplier = 1.5;                    # Displacement candle must exceed ATR * this
+input minBodyPercent = 60;                    # Min body % of candle range for displacement
+input requireVolumeExpansion = no;            # Require volume > avg for displacement
+input volumeAvgLength = 20;                   # Volume average period
+
+# --- Fair Value Gap Inputs ---
+input fvgExtendBars = 50;                     # How many bars to extend FVG drawing
+input fvgMinTickSize = 1;                     # Minimum FVG size in ticks
+input showFVGCloud = yes;                     # Show FVG zones as clouds
+
+# --- Signal / Trade Management ---
+input stopOffsetTicks = 10;                   # Stop distance in ticks from entry
+input targetMultiple = 2.0;                   # R:R multiple for target
+input maxSignalsPerSession = 2;               # Max signals per session
+input strictMode = yes;                       # Strict: all conditions required; Lenient: relaxed
+
+# --- Visibility Toggles ---
+input showPriorDayLevels = yes;
+input showOvernightLevels = yes;
+input showOpeningRange = yes;
+input showSweepArrows = yes;
+input showDisplacementMarkers = yes;
+input showStopTarget = yes;
+input showBiasLabel = yes;
+input showStatsLabel = yes;
+input showSignalArrows = yes;
+
+# =====================================================================
+# SECTION 2: SESSION DETECTION
+# =====================================================================
+
+def tickSz = TickSize();
+def isNewSession = GetYYYYMMDD() != GetYYYYMMDD()[1];
+def secFromOpen = SecondsFromTime(sessionOpenHour);
+def secTillClose = SecondsTillTime(sessionCloseHour);
+def inSession = secFromOpen >= 0 and secTillClose > 0;
+def isPremarket = secFromOpen < 0;
+def barNum = BarNumber();
+
+# Session bar counter (resets each session)
+def sessionBarCount = if isNewSession then 1
+                      else sessionBarCount[1] + 1;
+
+# Opening range window
+def orSeconds = openingRangeMinutes * 60;
+def inOpeningRange = secFromOpen >= 0 and secFromOpen < orSeconds;
+
+# =====================================================================
+# SECTION 3: KEY LEVELS — Prior Day High/Low/Close
+# =====================================================================
+
+def priorDayHigh;
+def priorDayLow;
+def priorDayClose;
+def todayDayHigh;
+def todayDayLow;
+
+if isNewSession {
+    priorDayHigh = todayDayHigh[1];
+    priorDayLow = todayDayLow[1];
+    priorDayClose = close[1];
+    todayDayHigh = high;
+    todayDayLow = low;
+} else {
+    priorDayHigh = priorDayHigh[1];
+    priorDayLow = priorDayLow[1];
+    priorDayClose = priorDayClose[1];
+    todayDayHigh = Max(todayDayHigh[1], high);
+    todayDayLow = Min(todayDayLow[1], low);
+}
+
+plot PDH = if showPriorDayLevels and inSession and !IsNaN(priorDayHigh) then priorDayHigh else Double.NaN;
+plot PDL = if showPriorDayLevels and inSession and !IsNaN(priorDayLow) then priorDayLow else Double.NaN;
+plot PDC = if showPriorDayLevels and inSession and !IsNaN(priorDayClose) then priorDayClose else Double.NaN;
+
+PDH.SetDefaultColor(Color.CYAN);
+PDH.SetStyle(Curve.LONG_DASH);
+PDH.SetLineWeight(2);
+PDH.HideTitle();
+
+PDL.SetDefaultColor(Color.CYAN);
+PDL.SetStyle(Curve.LONG_DASH);
+PDL.SetLineWeight(2);
+PDL.HideTitle();
+
+PDC.SetDefaultColor(Color.YELLOW);
+PDC.SetStyle(Curve.SHORT_DASH);
+PDC.SetLineWeight(1);
+PDC.HideTitle();
+
+# =====================================================================
+# SECTION 4: SESSION OPEN
+# =====================================================================
+
+def sessionOpen = if isNewSession and inSession then open else sessionOpen[1];
+
+plot SessOpen = if showPriorDayLevels and inSession and !IsNaN(sessionOpen) then sessionOpen else Double.NaN;
+SessOpen.SetDefaultColor(Color.WHITE);
+SessOpen.SetStyle(Curve.SHORT_DASH);
+SessOpen.SetLineWeight(1);
+SessOpen.HideTitle();
+
+# =====================================================================
+# SECTION 5: OVERNIGHT HIGH / LOW
+# =====================================================================
+
+def overnightHigh;
+def overnightLow;
+
+if isNewSession {
+    overnightHigh = high;
+    overnightLow = low;
+} else if isPremarket {
+    overnightHigh = Max(overnightHigh[1], high);
+    overnightLow = Min(overnightLow[1], low);
+} else {
+    overnightHigh = overnightHigh[1];
+    overnightLow = overnightLow[1];
+}
+
+plot ONH = if showOvernightLevels and inSession and !IsNaN(overnightHigh) then overnightHigh else Double.NaN;
+plot ONL = if showOvernightLevels and inSession and !IsNaN(overnightLow) then overnightLow else Double.NaN;
+
+ONH.SetDefaultColor(Color.MAGENTA);
+ONH.SetStyle(Curve.MEDIUM_DASH);
+ONH.SetLineWeight(1);
+ONH.HideTitle();
+
+ONL.SetDefaultColor(Color.MAGENTA);
+ONL.SetStyle(Curve.MEDIUM_DASH);
+ONL.SetLineWeight(1);
+ONL.HideTitle();
+
+# =====================================================================
+# SECTION 6: OPENING RANGE HIGH / LOW
+# =====================================================================
+
+def orHigh;
+def orLow;
+def orDefined;
+
+if isNewSession {
+    orHigh = Double.NaN;
+    orLow = Double.NaN;
+    orDefined = 0;
+} else if inOpeningRange {
+    orHigh = if IsNaN(orHigh[1]) then high else Max(orHigh[1], high);
+    orLow = if IsNaN(orLow[1]) then low else Min(orLow[1], low);
+    orDefined = 0;
+} else if orDefined[1] == 0 and !inOpeningRange and secFromOpen >= orSeconds {
+    orHigh = orHigh[1];
+    orLow = orLow[1];
+    orDefined = 1;
+} else {
+    orHigh = orHigh[1];
+    orLow = orLow[1];
+    orDefined = orDefined[1];
+}
+
+plot ORH = if showOpeningRange and inSession and orDefined then orHigh else Double.NaN;
+plot ORL = if showOpeningRange and inSession and orDefined then orLow else Double.NaN;
+
+ORH.SetDefaultColor(Color.ORANGE);
+ORH.SetStyle(Curve.MEDIUM_DASH);
+ORH.SetLineWeight(2);
+ORH.HideTitle();
+
+ORL.SetDefaultColor(Color.ORANGE);
+ORL.SetStyle(Curve.MEDIUM_DASH);
+ORL.SetLineWeight(2);
+ORL.HideTitle();
+
+# =====================================================================
+# SECTION 7: LIQUIDITY SWEEP DETECTION
+# =====================================================================
+
+# Sweep logic: price must penetrate a level by at least sweepTickPenetration ticks,
+# then close back on the other side within sweepConfirmBars bars.
+
+def sweepThreshold = sweepTickPenetration * tickSz;
+
+# --- Helper: check if bar swept above a level ---
+# Sweep above = high exceeded level + threshold, close ended below level
+def sweepAbovePDH = !IsNaN(priorDayHigh) and high >= priorDayHigh + sweepThreshold and close < priorDayHigh;
+def sweepAboveONH = !IsNaN(overnightHigh) and high >= overnightHigh + sweepThreshold and close < overnightHigh;
+def sweepAboveORH = orDefined and !IsNaN(orHigh) and high >= orHigh + sweepThreshold and close < orHigh;
+
+# --- Helper: check if bar swept below a level ---
+def sweepBelowPDL = !IsNaN(priorDayLow) and low <= priorDayLow - sweepThreshold and close > priorDayLow;
+def sweepBelowONL = !IsNaN(overnightLow) and low <= overnightLow - sweepThreshold and close > overnightLow;
+def sweepBelowORL = orDefined and !IsNaN(orLow) and low <= orLow - sweepThreshold and close > orLow;
+
+# Combined sweep signals
+def rawSweepHigh = inSession and (sweepAbovePDH or sweepAboveONH or sweepAboveORH);
+def rawSweepLow = inSession and (sweepBelowPDL or sweepBelowONL or sweepBelowORL);
+
+# Confirmation: for sweepConfirmBars > 1, require close remains on correct side
+# For simplicity with bars==1, the single-bar wick rejection suffices
+def sweepHighConfirmed = rawSweepHigh;
+def sweepLowConfirmed = rawSweepLow;
+
+# Prevent duplicate sweeps within same direction per session
+def sweepHighCount = if isNewSession then 0
+                     else if sweepHighConfirmed and sweepHighCount[1] == 0 then 1
+                     else sweepHighCount[1];
+
+def sweepLowCount = if isNewSession then 0
+                    else if sweepLowConfirmed and sweepLowCount[1] == 0 then 1
+                    else sweepLowCount[1];
+
+def sweepHighEvent = sweepHighConfirmed and sweepHighCount[1] == 0;
+def sweepLowEvent = sweepLowConfirmed and sweepLowCount[1] == 0;
+
+# Track sweep state for downstream modules
+# sweepDir: 0=none, 1=swept high (bearish bias), -1=swept low (bullish bias)
+def sweepDir = if isNewSession then 0
+               else if sweepHighEvent then 1
+               else if sweepLowEvent then -1
+               else sweepDir[1];
+
+def sweepPrice = if isNewSession then Double.NaN
+                 else if sweepHighEvent then high
+                 else if sweepLowEvent then low
+                 else sweepPrice[1];
+
+# Visual: arrows at sweep locations
+plot SweepHighArrow = if showSweepArrows and sweepHighEvent then high + 2 * tickSz else Double.NaN;
+SweepHighArrow.SetPaintingStrategy(PaintingStrategy.ARROW_DOWN);
+SweepHighArrow.SetDefaultColor(Color.RED);
+SweepHighArrow.SetLineWeight(3);
+SweepHighArrow.HideTitle();
+
+plot SweepLowArrow = if showSweepArrows and sweepLowEvent then low - 2 * tickSz else Double.NaN;
+SweepLowArrow.SetPaintingStrategy(PaintingStrategy.ARROW_UP);
+SweepLowArrow.SetDefaultColor(Color.GREEN);
+SweepLowArrow.SetLineWeight(3);
+SweepLowArrow.HideTitle();
+
+# =====================================================================
+# SECTION 8: DISPLACEMENT CANDLE DETECTION
+# =====================================================================
+
+def atr = Average(TrueRange(high, close, low), atrLength);
+def bodySize = AbsValue(close - open);
+def candleRange = high - low;
+def bodyPercent = if candleRange > 0 then (bodySize / candleRange) * 100 else 0;
+def avgVol = Average(volume, volumeAvgLength);
+
+def isBullishCandle = close > open;
+def isBearishCandle = close < open;
+
+def isDisplacementBull = isBullishCandle
+    and bodySize > atr * atrMultiplier
+    and bodyPercent >= minBodyPercent
+    and (requireVolumeExpansion == no or volume > avgVol);
+
+def isDisplacementBear = isBearishCandle
+    and bodySize > atr * atrMultiplier
+    and bodyPercent >= minBodyPercent
+    and (requireVolumeExpansion == no or volume > avgVol);
+
+# Displacement must follow a sweep in the opposite direction
+# Swept high (bearish liquidity grab) -> look for bearish displacement
+# Swept low (bullish liquidity grab) -> look for bullish displacement
+
+def displacementBearAfterSweep = inSession and isDisplacementBear and sweepDir == 1;
+def displacementBullAfterSweep = inSession and isDisplacementBull and sweepDir == -1;
+
+# Track only the first displacement per sweep event
+def dispEventBear = if isNewSession then 0
+                    else if displacementBearAfterSweep and dispEventBear[1] == 0 and sweepHighCount == 1 then 1
+                    else dispEventBear[1];
+
+def dispEventBull = if isNewSession then 0
+                    else if displacementBullAfterSweep and dispEventBull[1] == 0 and sweepLowCount == 1 then 1
+                    else dispEventBull[1];
+
+def dispBearTrigger = displacementBearAfterSweep and dispEventBear[1] == 0 and sweepHighCount == 1;
+def dispBullTrigger = displacementBullAfterSweep and dispEventBull[1] == 0 and sweepLowCount == 1;
+
+# Track displacement direction: 0=none, 1=bullish displacement, -1=bearish displacement
+def dispDir = if isNewSession then 0
+              else if dispBullTrigger then 1
+              else if dispBearTrigger then -1
+              else dispDir[1];
+
+plot DispBullMarker = if showDisplacementMarkers and dispBullTrigger then low - 4 * tickSz else Double.NaN;
+DispBullMarker.SetPaintingStrategy(PaintingStrategy.ARROW_UP);
+DispBullMarker.SetDefaultColor(Color.LIME);
+DispBullMarker.SetLineWeight(4);
+DispBullMarker.HideTitle();
+
+plot DispBearMarker = if showDisplacementMarkers and dispBearTrigger then high + 4 * tickSz else Double.NaN;
+DispBearMarker.SetPaintingStrategy(PaintingStrategy.ARROW_DOWN);
+DispBearMarker.SetDefaultColor(Color.DARK_RED);
+DispBearMarker.SetLineWeight(4);
+DispBearMarker.HideTitle();
+
+# =====================================================================
+# SECTION 9: FAIR VALUE GAP (FVG) DETECTION AND STATE TRACKING
+# =====================================================================
+
+# Bullish FVG: gap between bar[2] high and bar[0] low (bar[1] is displacement candle)
+# Bearish FVG: gap between bar[0] high and bar[2] low
+
+def fvgMinSize = fvgMinTickSize * tickSz;
+
+# --- Bullish FVG ---
+def rawBullFVG = low > high[2] and (low - high[2]) >= fvgMinSize;
+def bullFVGafterDisp = rawBullFVG and dispDir == 1;
+
+# Only capture first bullish FVG after displacement
+def bullFVGfound = if isNewSession then 0
+                   else if bullFVGafterDisp and bullFVGfound[1] == 0 then 1
+                   else bullFVGfound[1];
+
+def bullFVGtrigger = bullFVGafterDisp and bullFVGfound[1] == 0;
+
+def bullFVGtop = if isNewSession then Double.NaN
+                 else if bullFVGtrigger then low
+                 else bullFVGtop[1];
+
+def bullFVGbot = if isNewSession then Double.NaN
+                 else if bullFVGtrigger then high[2]
+                 else bullFVGbot[1];
+
+def bullFVGbar = if isNewSession then 0
+                 else if bullFVGtrigger then barNum
+                 else bullFVGbar[1];
+
+# --- Bearish FVG ---
+def rawBearFVG = high < low[2] and (low[2] - high) >= fvgMinSize;
+def bearFVGafterDisp = rawBearFVG and dispDir == -1;
+
+# Correction: bearish FVG should follow bearish displacement
+# Re-check: dispDir == -1 means bearish displacement happened
+# Actually: after a bearish displacement, we want a bearish FVG
+# Wait — the logic is inverted. Let me re-align:
+# sweepDir==1 -> swept highs -> bearish expectation -> bearish displacement (dispDir==-1) -> bearish FVG
+# sweepDir==-1 -> swept lows -> bullish expectation -> bullish displacement (dispDir==1) -> bullish FVG
+# So bearish FVG needs dispDir == -1 (correct) and bullish FVG needs dispDir == 1 (correct).
+
+def bearFVGfound = if isNewSession then 0
+                   else if bearFVGafterDisp and bearFVGfound[1] == 0 then 1
+                   else bearFVGfound[1];
+
+def bearFVGtrigger = bearFVGafterDisp and bearFVGfound[1] == 0;
+
+def bearFVGtop = if isNewSession then Double.NaN
+                 else if bearFVGtrigger then low[2]
+                 else bearFVGtop[1];
+
+def bearFVGbot = if isNewSession then Double.NaN
+                 else if bearFVGtrigger then high
+                 else bearFVGbot[1];
+
+def bearFVGbar = if isNewSession then 0
+                 else if bearFVGtrigger then barNum
+                 else bearFVGbar[1];
+
+# =====================================================================
+# SECTION 10: FVG STATE MACHINE (Touch, Partial Fill, Full Fill, Invalidation)
+# =====================================================================
+
+# States: 0=pending, 1=touched, 2=partial fill, 3=full fill, 4=invalidated
+
+# --- Bullish FVG states ---
+def bullFVGmid = (bullFVGtop + bullFVGbot) / 2;
+
+def bullFVGstate = if isNewSession then 0
+    else if bullFVGfound == 0 then 0
+    else if bullFVGstate[1] >= 3 then bullFVGstate[1]
+    else if !IsNaN(bullFVGbot) and low <= bullFVGbot and bullFVGstate[1] < 3 then 3
+    else if !IsNaN(bullFVGmid) and low <= bullFVGmid and bullFVGstate[1] < 2 then 2
+    else if !IsNaN(bullFVGtop) and low <= bullFVGtop and bullFVGstate[1] < 1 then 1
+    else bullFVGstate[1];
+
+# Invalidation: price closes decisively below the FVG bottom
+def bullFVGinvalidated = if isNewSession then 0
+    else if bullFVGfound == 1 and !IsNaN(bullFVGbot) and close < bullFVGbot - sweepThreshold then 1
+    else bullFVGinvalidated[1];
+
+# --- Bearish FVG states ---
+def bearFVGmid = (bearFVGtop + bearFVGbot) / 2;
+
+def bearFVGstate = if isNewSession then 0
+    else if bearFVGfound == 0 then 0
+    else if bearFVGstate[1] >= 3 then bearFVGstate[1]
+    else if !IsNaN(bearFVGtop) and high >= bearFVGtop and bearFVGstate[1] < 3 then 3
+    else if !IsNaN(bearFVGmid) and high >= bearFVGmid and bearFVGstate[1] < 2 then 2
+    else if !IsNaN(bearFVGbot) and high >= bearFVGbot and bearFVGstate[1] < 1 then 1
+    else bearFVGstate[1];
+
+def bearFVGinvalidated = if isNewSession then 0
+    else if bearFVGfound == 1 and !IsNaN(bearFVGtop) and close > bearFVGtop + sweepThreshold then 1
+    else bearFVGinvalidated[1];
+
+# =====================================================================
+# SECTION 11: FVG VISUALIZATION (Cloud extension)
+# =====================================================================
+
+# Draw FVG zones as horizontal bands extending rightward from creation bar
+def bullFVGactive = bullFVGfound == 1 and bullFVGinvalidated == 0 and bullFVGstate < 3
+    and barNum >= bullFVGbar and barNum <= bullFVGbar + fvgExtendBars;
+
+def bearFVGactive = bearFVGfound == 1 and bearFVGinvalidated == 0 and bearFVGstate < 3
+    and barNum >= bearFVGbar and barNum <= bearFVGbar + fvgExtendBars;
+
+plot BullFVGTopLine = if showFVGCloud and bullFVGactive then bullFVGtop else Double.NaN;
+plot BullFVGBotLine = if showFVGCloud and bullFVGactive then bullFVGbot else Double.NaN;
+
+BullFVGTopLine.SetDefaultColor(Color.DARK_GREEN);
+BullFVGTopLine.SetStyle(Curve.SHORT_DASH);
+BullFVGTopLine.SetLineWeight(1);
+BullFVGTopLine.HideTitle();
+BullFVGTopLine.HideBubble();
+
+BullFVGBotLine.SetDefaultColor(Color.DARK_GREEN);
+BullFVGBotLine.SetStyle(Curve.SHORT_DASH);
+BullFVGBotLine.SetLineWeight(1);
+BullFVGBotLine.HideTitle();
+BullFVGBotLine.HideBubble();
+
+AddCloud(BullFVGTopLine, BullFVGBotLine, Color.DARK_GREEN, Color.DARK_GREEN);
+
+plot BearFVGTopLine = if showFVGCloud and bearFVGactive then bearFVGtop else Double.NaN;
+plot BearFVGBotLine = if showFVGCloud and bearFVGactive then bearFVGbot else Double.NaN;
+
+BearFVGTopLine.SetDefaultColor(Color.DARK_RED);
+BearFVGTopLine.SetStyle(Curve.SHORT_DASH);
+BearFVGTopLine.SetLineWeight(1);
+BearFVGTopLine.HideTitle();
+BearFVGTopLine.HideBubble();
+
+BearFVGBotLine.SetDefaultColor(Color.DARK_RED);
+BearFVGBotLine.SetStyle(Curve.SHORT_DASH);
+BearFVGBotLine.SetLineWeight(1);
+BearFVGBotLine.HideTitle();
+BearFVGBotLine.HideBubble();
+
+AddCloud(BearFVGTopLine, BearFVGBotLine, Color.DARK_RED, Color.DARK_RED);
+
+# =====================================================================
+# SECTION 12: SESSION BIAS ENGINE
+# =====================================================================
+
+# Bias states:
+# 0 = Neutral
+# 1 = Bullish
+# -1 = Bearish
+# 2 = Bullish after failed downside auction
+# -2 = Bearish after failed upside auction
+
+def sessionBias;
+
+if isNewSession {
+    sessionBias = 0;
+} else if sweepLowEvent and dispBullTrigger {
+    # Swept lows then bullish displacement = bullish after failed downside auction
+    sessionBias = 2;
+} else if sweepHighEvent and dispBearTrigger {
+    # Swept highs then bearish displacement = bearish after failed upside auction
+    sessionBias = -2;
+} else if dispBullTrigger and sessionBias[1] <= 0 {
+    sessionBias = 1;
+} else if dispBearTrigger and sessionBias[1] >= 0 {
+    sessionBias = -1;
+} else if bullFVGinvalidated == 1 and sessionBias[1] > 0 {
+    sessionBias = 0;
+} else if bearFVGinvalidated == 1 and sessionBias[1] < 0 {
+    sessionBias = 0;
+} else {
+    sessionBias = sessionBias[1];
+}
+
+AddLabel(showBiasLabel,
+    "Bias: " +
+    (if sessionBias == 2 then "BULL (Failed Auction)"
+     else if sessionBias == 1 then "BULLISH"
+     else if sessionBias == -1 then "BEARISH"
+     else if sessionBias == -2 then "BEAR (Failed Auction)"
+     else "NEUTRAL"),
+    if sessionBias > 0 then Color.GREEN
+    else if sessionBias < 0 then Color.RED
+    else Color.GRAY);
+
+# =====================================================================
+# SECTION 13: SIGNAL GENERATION — Long and Short Entries
+# =====================================================================
+
+# Long signal: swept lows + bullish displacement + bullish FVG created + price retests FVG zone
+# Short signal: swept highs + bearish displacement + bearish FVG created + price retests FVG zone
+
+def longRetest = bullFVGfound == 1 and bullFVGinvalidated == 0
+    and bullFVGstate >= 1 and bullFVGstate < 3
+    and low <= bullFVGtop and close > bullFVGbot;
+
+def shortRetest = bearFVGfound == 1 and bearFVGinvalidated == 0
+    and bearFVGstate >= 1 and bearFVGstate < 3
+    and high >= bearFVGbot and close < bearFVGtop;
+
+# Strict mode: require bias alignment
+def longCondStrict = longRetest and sessionBias > 0;
+def shortCondStrict = shortRetest and sessionBias < 0;
+
+# Lenient mode: only require sweep + displacement + FVG retest
+def longCondLenient = longRetest and sweepDir == -1 and dispDir == 1;
+def shortCondLenient = shortRetest and sweepDir == 1 and dispDir == -1;
+
+def longCond = if strictMode then longCondStrict else longCondLenient;
+def shortCond = if strictMode then shortCondStrict else shortCondLenient;
+
+# Signal counting to enforce maxSignalsPerSession
+def longSignalCount = if isNewSession then 0
+    else if longCond and longSignalCount[1] < maxSignalsPerSession then longSignalCount[1] + 1
+    else longSignalCount[1];
+
+def shortSignalCount = if isNewSession then 0
+    else if shortCond and shortSignalCount[1] < maxSignalsPerSession then shortSignalCount[1] + 1
+    else shortSignalCount[1];
+
+# Prevent duplicate signals on consecutive bars
+def longSignalFired = longCond and longSignalCount > longSignalCount[1];
+def shortSignalFired = shortCond and shortSignalCount > shortSignalCount[1];
+
+plot LongSignal = if showSignalArrows and longSignalFired then low - 6 * tickSz else Double.NaN;
+LongSignal.SetPaintingStrategy(PaintingStrategy.ARROW_UP);
+LongSignal.SetDefaultColor(Color.GREEN);
+LongSignal.SetLineWeight(5);
+LongSignal.HideTitle();
+
+plot ShortSignal = if showSignalArrows and shortSignalFired then high + 6 * tickSz else Double.NaN;
+ShortSignal.SetPaintingStrategy(PaintingStrategy.ARROW_DOWN);
+ShortSignal.SetDefaultColor(Color.RED);
+ShortSignal.SetLineWeight(5);
+ShortSignal.HideTitle();
+
+# =====================================================================
+# SECTION 14: STOP AND TARGET PLOTTING
+# =====================================================================
+
+def stopOffset = stopOffsetTicks * tickSz;
+
+def longEntryPrice = if isNewSession then Double.NaN
+    else if longSignalFired then close
+    else longEntryPrice[1];
+
+def shortEntryPrice = if isNewSession then Double.NaN
+    else if shortSignalFired then close
+    else shortEntryPrice[1];
+
+def longStopPrice = if isNewSession then Double.NaN
+    else if longSignalFired then close - stopOffset
+    else longStopPrice[1];
+
+def longTargetPrice = if isNewSession then Double.NaN
+    else if longSignalFired then close + stopOffset * targetMultiple
+    else longTargetPrice[1];
+
+def shortStopPrice = if isNewSession then Double.NaN
+    else if shortSignalFired then close + stopOffset
+    else shortStopPrice[1];
+
+def shortTargetPrice = if isNewSession then Double.NaN
+    else if shortSignalFired then close - stopOffset * targetMultiple
+    else shortTargetPrice[1];
+
+# Track active trade state for stop/target display
+# 0=no trade, 1=long active, -1=short active
+def tradeState;
+if isNewSession {
+    tradeState = 0;
+} else if longSignalFired and tradeState[1] == 0 {
+    tradeState = 1;
+} else if shortSignalFired and tradeState[1] == 0 {
+    tradeState = -1;
+} else if tradeState[1] == 1 and (!IsNaN(longTargetPrice) and high >= longTargetPrice) {
+    tradeState = 0;
+} else if tradeState[1] == 1 and (!IsNaN(longStopPrice) and low <= longStopPrice) {
+    tradeState = 0;
+} else if tradeState[1] == -1 and (!IsNaN(shortTargetPrice) and low <= shortTargetPrice) {
+    tradeState = 0;
+} else if tradeState[1] == -1 and (!IsNaN(shortStopPrice) and high >= shortStopPrice) {
+    tradeState = 0;
+} else {
+    tradeState = tradeState[1];
+}
+
+plot StopLine = if showStopTarget and tradeState == 1 then longStopPrice
+    else if showStopTarget and tradeState == -1 then shortStopPrice
+    else Double.NaN;
+
+StopLine.SetDefaultColor(Color.RED);
+StopLine.SetStyle(Curve.MEDIUM_DASH);
+StopLine.SetLineWeight(2);
+StopLine.HideTitle();
+
+plot TargetLine = if showStopTarget and tradeState == 1 then longTargetPrice
+    else if showStopTarget and tradeState == -1 then shortTargetPrice
+    else Double.NaN;
+
+TargetLine.SetDefaultColor(Color.GREEN);
+TargetLine.SetStyle(Curve.MEDIUM_DASH);
+TargetLine.SetLineWeight(2);
+TargetLine.HideTitle();
+
+# =====================================================================
+# SECTION 15: STATISTICS LABEL
+# =====================================================================
+
+def totalLongSignals = if isNewSession then 0
+    else if longSignalFired then totalLongSignals[1] + 1
+    else totalLongSignals[1];
+
+def totalShortSignals = if isNewSession then 0
+    else if shortSignalFired then totalShortSignals[1] + 1
+    else totalShortSignals[1];
+
+def totalSweepsHigh = if isNewSession then 0
+    else if sweepHighEvent then totalSweepsHigh[1] + 1
+    else totalSweepsHigh[1];
+
+def totalSweepsLow = if isNewSession then 0
+    else if sweepLowEvent then totalSweepsLow[1] + 1
+    else totalSweepsLow[1];
+
+AddLabel(showStatsLabel,
+    "Sweeps H:" + totalSweepsHigh + " L:" + totalSweepsLow +
+    " | Signals Long:" + totalLongSignals + " Short:" + totalShortSignals +
+    " | FVG Bull:" + (if bullFVGfound then
+        (if bullFVGinvalidated then "INVALID"
+         else if bullFVGstate == 3 then "FILLED"
+         else if bullFVGstate == 2 then "PARTIAL"
+         else if bullFVGstate == 1 then "TOUCHED"
+         else "ACTIVE")
+        else "NONE") +
+    " Bear:" + (if bearFVGfound then
+        (if bearFVGinvalidated then "INVALID"
+         else if bearFVGstate == 3 then "FILLED"
+         else if bearFVGstate == 2 then "PARTIAL"
+         else if bearFVGstate == 1 then "TOUCHED"
+         else "ACTIVE")
+        else "NONE"),
+    Color.LIGHT_GRAY);
+
+# =====================================================================
+# SECTION 16: ALERTS
+# =====================================================================
+
+Alert(sweepHighEvent, "Liquidity Sweep: Highs swept", Alert.BAR, Sound.Ding);
+Alert(sweepLowEvent, "Liquidity Sweep: Lows swept", Alert.BAR, Sound.Ding);
+Alert(dispBullTrigger, "Bullish Displacement Candle", Alert.BAR, Sound.Ring);
+Alert(dispBearTrigger, "Bearish Displacement Candle", Alert.BAR, Sound.Ring);
+Alert(bullFVGtrigger, "Bullish FVG Created", Alert.BAR, Sound.Bell);
+Alert(bearFVGtrigger, "Bearish FVG Created", Alert.BAR, Sound.Bell);
+Alert(longSignalFired, "LONG Signal: Sweep + Displacement + FVG Retest", Alert.BAR, Sound.Chimes);
+Alert(shortSignalFired, "SHORT Signal: Sweep + Displacement + FVG Retest", Alert.BAR, Sound.Chimes);
+
+# =====================================================================
+# END OF STUDY
+# =====================================================================

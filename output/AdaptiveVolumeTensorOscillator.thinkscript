@@ -1,0 +1,961 @@
+# =============================================================================
+# ADAPTIVE VOLUME TENSOR OSCILLATOR (AVTO)
+# Lower study — transforms raw volume into multi-layer directional pressure
+# =============================================================================
+# Subsystems:
+#   1. Base Transformation Engine (close-location, body-to-range, wick-imbalance,
+#      range-adjusted signed volume, blended composite)
+#   2. Weighting Engine (relative volume, TR expansion, body efficiency, price
+#      change persistence — each independently toggleable)
+#   3. Normalization Engine (MA-ratio, highest-abs, z-score, percentile-rank,
+#      min-max — user-selectable with optional clamping)
+#   4. Oscillator Construction (fast, slow, signal, histogram, zero baseline,
+#      impulse / first derivative, curvature / second derivative)
+#   5. Regime Classification Engine (8 discrete regimes based on sign, slope,
+#      histogram expansion, distance from zero)
+#   6. Compression-Expansion Module (narrow-range detection, breakout detection,
+#      strict/lenient logic, first-bar-only signals)
+#   7. Exhaustion Engine (extreme-zone deterioration, early/confirmed modes,
+#      divergence between oscillator & price quality)
+#   8. Divergence Engine (regular & hidden, configurable pivot strength, max
+#      spacing, min oscillator separation, extreme-zone requirement)
+#   9. Cumulative Pressure Module (rolling cumulative pressure vs price, 4
+#      imbalance states feeding regime engine)
+#  10. Multi-Time-Horizon Alignment (short/med/long lookback horizons,
+#      alignment / disagreement classification)
+#  11. Composite Confidence Score (weighted combination of regime, divergence,
+#      exhaustion, compression, alignment)
+#  12. Alerts (state-transition only, modular on/off)
+#  13. Visualization (all plots individually toggleable)
+#
+# ThinkScript Limitations & Approximations:
+#   - No true multi-timeframe aggregation within a single lower study without
+#     secondary aggregation. Horizons are approximated via different lookback
+#     lengths on the current aggregation.
+#   - Percentile ranking is approximated via a fold-based count of values
+#     below current value over the lookback window.
+#   - Pivot detection uses simple left/right strength comparison; no lookahead
+#     beyond right-strength bars (may lag by rightStrength bars — unavoidable).
+#   - Divergence detection necessarily looks back by rightStrength bars to
+#     confirm pivots; signals print on the bar the pivot is confirmed.
+#   - CompoundValue is used for all recursive state variables.
+#   - All divisions are guarded against zero denominators.
+# =============================================================================
+
+declare lower;
+
+# =============================================================================
+# SECTION 1: INPUTS — BASE TRANSFORMATION
+# =============================================================================
+
+input transformMode = {default "CloseLoc", "BodyRange", "WickImbalance", "RangeAdjVol", "Blended"};
+# CloseLoc     = close-location within bar range: (close - low) / range * 2 - 1
+# BodyRange    = body-to-range signed pressure: sign(close-open) * abs(close-open) / range
+# WickImbalance = wick-imbalance pressure: (upperWick - lowerWick) / range  (inverted sign implied by wick dominance)
+# RangeAdjVol  = range-adjusted signed volume: sign(close-open) * volume * (range / avgRange)
+# Blended      = weighted combination of all four
+
+# Blend weights (used only in Blended mode)
+input enableCloseLoc = yes;
+input weightCloseLoc = 25.0;
+input enableBodyRange = yes;
+input weightBodyRange = 25.0;
+input enableWickImbal = yes;
+input weightWickImbal = 25.0;
+input enableRangeAdjVol = yes;
+input weightRangeAdjVol = 25.0;
+
+# =============================================================================
+# SECTION 2: INPUTS — WEIGHTING ENGINE
+# =============================================================================
+
+input useRelativeVolume = yes;
+input relVolLength = 20;
+input useTrueRangeExpansion = yes;
+input trLength = 14;
+input useBodyEfficiency = yes;
+input usePriceChangePersistence = yes;
+input persistenceLength = 5;
+
+# =============================================================================
+# SECTION 3: INPUTS — NORMALIZATION ENGINE
+# =============================================================================
+
+input normMode = {default "MARatio", "HighestAbs", "ZScore", "Percentile", "MinMax"};
+# MARatio    = value / movAvg(absValue, normLen) — centered around 1/-1
+# HighestAbs = value / highest(absValue, normLen) — bounded [-1, 1]
+# ZScore     = (value - mean) / stdev — unbounded
+# Percentile = fold-based percentile rank mapped to [-1, 1]
+# MinMax     = (value - min) / (max - min) mapped to [clampLo, clampHi]
+
+input normLength = 50;
+input clampEnabled = yes;
+input clampHi = 100.0;
+input clampLo = -100.0;
+
+# =============================================================================
+# SECTION 4: INPUTS — OSCILLATOR CONSTRUCTION
+# =============================================================================
+
+input fastLength = 8;
+input slowLength = 21;
+input signalLength = 5;
+input impulseLength = 3;
+input curvatureLength = 3;
+input oscSmoothType = AverageType.EXPONENTIAL;
+
+# =============================================================================
+# SECTION 5: INPUTS — REGIME ENGINE
+# =============================================================================
+
+input regimeStrictMode = yes;
+input regimeDistThreshold = 30.0;
+
+# =============================================================================
+# SECTION 6: INPUTS — COMPRESSION / EXPANSION
+# =============================================================================
+
+input compressionThreshold = 15.0;
+input compressionMinBars = 8;
+input expansionStrictness = {default "Strict", "Lenient"};
+
+# =============================================================================
+# SECTION 7: INPUTS — EXHAUSTION ENGINE
+# =============================================================================
+
+input exhaustionThreshold = 70.0;
+input exhaustionConfirmBars = 3;
+input exhaustionMode = {default "Early", "Confirmed"};
+
+# =============================================================================
+# SECTION 8: INPUTS — DIVERGENCE ENGINE
+# =============================================================================
+
+input divPivotLeftStrength = 5;
+input divPivotRightStrength = 3;
+input divMaxSpacing = 100;
+input divMinOscSeparation = 5.0;
+input divRequireExtremeZone = no;
+input divExtremeLevel = 60.0;
+
+# =============================================================================
+# SECTION 9: INPUTS — CUMULATIVE PRESSURE
+# =============================================================================
+
+input cumulativePressureMode = {default "Rolling", "Session"};
+input cumulativeRollingLength = 50;
+
+# =============================================================================
+# SECTION 10: INPUTS — MULTI-TIME-HORIZON
+# =============================================================================
+
+input shortHorizonLength = 8;
+input mediumHorizonLength = 21;
+input longHorizonLength = 55;
+
+# =============================================================================
+# SECTION 11: INPUTS — CONFIDENCE SCORE
+# =============================================================================
+
+input confWeightRegime = 25.0;
+input confWeightDivergence = 20.0;
+input confWeightExhaustion = 20.0;
+input confWeightCompression = 15.0;
+input confWeightAlignment = 20.0;
+
+# =============================================================================
+# SECTION 12: INPUTS — VISIBILITY TOGGLES
+# =============================================================================
+
+input showFastLine = yes;
+input showSlowLine = yes;
+input showSignalLine = yes;
+input showHistogram = yes;
+input showZeroLine = yes;
+input showImpulseLine = no;
+input showCurvatureLine = no;
+input showConfidencePlot = no;
+input showExtremeBands = yes;
+input showDivergenceMarkers = yes;
+input showCompressionMarkers = yes;
+input showExhaustionMarkers = yes;
+input showRegimeLabels = yes;
+input showRegimeBackground = no;
+
+# =============================================================================
+# SECTION 13: INPUTS — ALERTS
+# =============================================================================
+
+input alertsEnabled = yes;
+input alertBullishExpansion = yes;
+input alertBearishExpansion = yes;
+input alertCompressionEntry = yes;
+input alertCompressionBreakout = yes;
+input alertBullishDivergence = yes;
+input alertBearishDivergence = yes;
+input alertHiddenBullishDiv = yes;
+input alertHiddenBearishDiv = yes;
+input alertBullishExhaustion = yes;
+input alertBearishExhaustion = yes;
+input alertFullBullishAlignment = yes;
+input alertFullBearishAlignment = yes;
+
+# =============================================================================
+# SECTION 14: BASE TRANSFORMATION ENGINE
+# =============================================================================
+# Computes four independent signed pressure series from OHLCV, then selects
+# the active mode or blends them.
+
+def barRange = high - low;
+def safeRange = if barRange == 0 then Double.NaN else barRange;
+def bodySize = AbsValue(close - open);
+def candleSign = if close >= open then 1 else -1;
+def upperWick = high - Max(close, open);
+def lowerWick = Min(close, open) - low;
+def avgRange = Average(barRange, normLength);
+def safeAvgRange = if avgRange == 0 then Double.NaN else avgRange;
+def safeVol = if volume == 0 then Double.NaN else volume;
+
+# Mode 1: Close-Location [-1, +1]
+def closeLoc = if IsNaN(safeRange) then 0 else (close - low) / safeRange * 2 - 1;
+
+# Mode 2: Body-to-Range signed pressure [-1, +1]
+def bodyRange = if IsNaN(safeRange) then 0 else candleSign * bodySize / safeRange;
+
+# Mode 3: Wick-imbalance pressure [-1, +1]
+# Positive => lower wick dominant (buying pressure), negative => upper wick dominant
+def wickImbal = if IsNaN(safeRange) then 0 else (lowerWick - upperWick) / safeRange;
+
+# Mode 4: Range-adjusted signed volume
+def rangeAdj = if IsNaN(safeAvgRange) or IsNaN(safeVol) then 0
+               else candleSign * volume * (barRange / safeAvgRange);
+
+# Normalize rangeAdj to comparable scale via its own average
+def avgRangeAdj = Average(AbsValue(rangeAdj), normLength);
+def safeAvgRangeAdj = if avgRangeAdj == 0 then Double.NaN else avgRangeAdj;
+def rangeAdjNorm = if IsNaN(safeAvgRangeAdj) then 0 else rangeAdj / safeAvgRangeAdj;
+
+# Blended composite
+def totalWeight = (if enableCloseLoc then weightCloseLoc else 0) +
+                  (if enableBodyRange then weightBodyRange else 0) +
+                  (if enableWickImbal then weightWickImbal else 0) +
+                  (if enableRangeAdjVol then weightRangeAdjVol else 0);
+def safeTotalWeight = if totalWeight == 0 then Double.NaN else totalWeight;
+
+def blendedRaw = if IsNaN(safeTotalWeight) then 0 else
+    ((if enableCloseLoc then weightCloseLoc * closeLoc else 0) +
+     (if enableBodyRange then weightBodyRange * bodyRange else 0) +
+     (if enableWickImbal then weightWickImbal * wickImbal else 0) +
+     (if enableRangeAdjVol then weightRangeAdjVol * rangeAdjNorm else 0))
+    / safeTotalWeight;
+
+# Select active base pressure
+def basePressure =
+    if transformMode == transformMode."CloseLoc" then closeLoc
+    else if transformMode == transformMode."BodyRange" then bodyRange
+    else if transformMode == transformMode."WickImbalance" then wickImbal
+    else if transformMode == transformMode."RangeAdjVol" then rangeAdjNorm
+    else blendedRaw;
+
+# =============================================================================
+# SECTION 15: WEIGHTING ENGINE
+# =============================================================================
+# Each module multiplies pressure by a factor >= 0. Disabled modules contribute
+# a factor of 1.0 (neutral).
+
+# Relative volume factor
+def avgVol = Average(volume, relVolLength);
+def safeAvgVol = if avgVol == 0 then Double.NaN else avgVol;
+def relVolFactor = if !useRelativeVolume or IsNaN(safeAvgVol) or IsNaN(safeVol)
+                   then 1.0
+                   else volume / safeAvgVol;
+
+# True range expansion factor
+def tr = Max(high - low, Max(AbsValue(high - close[1]), AbsValue(low - close[1])));
+def avgTR = Average(tr, trLength);
+def safeAvgTR = if avgTR == 0 then Double.NaN else avgTR;
+def trFactor = if !useTrueRangeExpansion or IsNaN(safeAvgTR) then 1.0
+               else tr / safeAvgTR;
+
+# Body efficiency factor [0, 1]
+def bodyEff = if IsNaN(safeRange) then 0 else bodySize / safeRange;
+def bodyEffFactor = if !useBodyEfficiency then 1.0 else Max(bodyEff, 0.05);
+
+# Price change persistence factor
+# Counts consecutive same-direction closes over persistenceLength bars
+def priceDir = if close > close[1] then 1 else if close < close[1] then -1 else 0;
+def persistCount = fold pIdx = 1 to persistenceLength + 1
+    with pAcc = 0
+    do if (priceDir == 1 and GetValue(close, pIdx) <= GetValue(close, pIdx + 1)) or
+          (priceDir == -1 and GetValue(close, pIdx) >= GetValue(close, pIdx + 1))
+       then pAcc
+       else pAcc + 1;
+def persistFactor = if !usePriceChangePersistence then 1.0
+                    else 1.0 + persistCount / persistenceLength;
+
+# Combined weighted pressure
+def weightedPressure = basePressure * relVolFactor * trFactor * bodyEffFactor * persistFactor;
+
+# =============================================================================
+# SECTION 16: NORMALIZATION ENGINE
+# =============================================================================
+
+def absWP = AbsValue(weightedPressure);
+def meanWP = Average(weightedPressure, normLength);
+def stdevWP = StDev(weightedPressure, normLength);
+def safeStdev = if stdevWP == 0 then Double.NaN else stdevWP;
+def highestAbsWP = Highest(absWP, normLength);
+def safeHighestAbs = if highestAbsWP == 0 then Double.NaN else highestAbsWP;
+def avgAbsWP = Average(absWP, normLength);
+def safeAvgAbsWP = if avgAbsWP == 0 then Double.NaN else avgAbsWP;
+def lowestWP = Lowest(weightedPressure, normLength);
+def highestWP = Highest(weightedPressure, normLength);
+def wpRangeNorm = highestWP - lowestWP;
+def safeWpRange = if wpRangeNorm == 0 then Double.NaN else wpRangeNorm;
+
+# Percentile rank via fold: count values below current over lookback
+def pctRank = fold rIdx = 1 to normLength + 1
+    with rAcc = 0
+    do rAcc + if weightedPressure[rIdx] < weightedPressure then 1 else 0;
+def pctRankNorm = (pctRank / normLength) * 2 - 1;  # map [0,1] to [-1,1]
+
+# Apply selected normalization
+def normalizedRaw =
+    if normMode == normMode."MARatio" then
+        (if IsNaN(safeAvgAbsWP) then 0 else weightedPressure / safeAvgAbsWP)
+    else if normMode == normMode."HighestAbs" then
+        (if IsNaN(safeHighestAbs) then 0 else weightedPressure / safeHighestAbs * 100)
+    else if normMode == normMode."ZScore" then
+        (if IsNaN(safeStdev) then 0 else (weightedPressure - meanWP) / safeStdev)
+    else if normMode == normMode."Percentile" then
+        pctRankNorm * 100
+    else  # MinMax
+        (if IsNaN(safeWpRange) then 0 else
+            (weightedPressure - lowestWP) / safeWpRange * (clampHi - clampLo) + clampLo);
+
+# Clamp output
+def normalized = if clampEnabled then Max(clampLo, Min(clampHi, normalizedRaw))
+                 else normalizedRaw;
+
+# =============================================================================
+# SECTION 17: OSCILLATOR CONSTRUCTION
+# =============================================================================
+
+def fastLine = MovingAverage(oscSmoothType, normalized, fastLength);
+def slowLine_ = MovingAverage(oscSmoothType, normalized, slowLength);
+def signalLine_ = MovingAverage(oscSmoothType, fastLine, signalLength);
+def histogram_ = fastLine - signalLine_;
+
+# Impulse = slope / first derivative of fast line
+def impulse_ = MovingAverage(oscSmoothType, fastLine - fastLine[1], impulseLength);
+
+# Curvature = second derivative / acceleration
+def curvature_ = MovingAverage(oscSmoothType, impulse_ - impulse_[1], curvatureLength);
+
+# =============================================================================
+# SECTION 18: REGIME CLASSIFICATION ENGINE
+# =============================================================================
+# 8 regimes derived from oscillator sign, slope, histogram expansion, and
+# normalized distance from zero.
+#
+# Regime codes:
+#   1 = Bullish Expansion      5 = Bearish Expansion
+#   2 = Bullish Continuation   6 = Bearish Continuation
+#   3 = Bullish Exhaustion     7 = Bearish Exhaustion
+#   4 = Compressed Balance     8 = Transition / Unstable
+
+def oscSlope = fastLine - fastLine[1];
+def histExpanding = AbsValue(histogram_) > AbsValue(histogram_[1]);
+def distFromZero = AbsValue(fastLine);
+def isFarFromZero = distFromZero > regimeDistThreshold;
+def isNearZero = distFromZero <= regimeDistThreshold;
+
+def regime;
+if fastLine > 0 and oscSlope > 0 and histExpanding and isFarFromZero {
+    regime = 1;  # Bullish Expansion
+} else if fastLine > 0 and oscSlope > 0 and !histExpanding {
+    regime = 2;  # Bullish Continuation
+} else if fastLine > 0 and oscSlope <= 0 and isFarFromZero {
+    regime = 3;  # Bullish Exhaustion
+} else if fastLine < 0 and oscSlope < 0 and histExpanding and isFarFromZero {
+    regime = 5;  # Bearish Expansion
+} else if fastLine < 0 and oscSlope < 0 and !histExpanding {
+    regime = 6;  # Bearish Continuation
+} else if fastLine < 0 and oscSlope >= 0 and isFarFromZero {
+    regime = 7;  # Bearish Exhaustion
+} else if isNearZero and !histExpanding {
+    regime = 4;  # Compressed Balance
+} else {
+    regime = 8;  # Transition / Unstable
+}
+
+# =============================================================================
+# SECTION 19: COMPRESSION-EXPANSION MODULE
+# =============================================================================
+# Compression: oscillator AND histogram stay within narrow band for N bars.
+# Expansion: exit compressed state with rising slope / histogram magnitude.
+
+def isCompressedBar = AbsValue(fastLine) < compressionThreshold and
+                      AbsValue(histogram_) < compressionThreshold;
+
+# Count consecutive compressed bars
+def compBarCount = CompoundValue(1,
+    if isCompressedBar then compBarCount[1] + 1 else 0, 0);
+
+# Compression state latch
+def inCompressionState = CompoundValue(1,
+    if compBarCount >= compressionMinBars then yes
+    else if inCompressionState[1] and isCompressedBar then yes
+    else no, no);
+
+# Expansion detection
+def slopeRising = AbsValue(oscSlope) > AbsValue(oscSlope[1]);
+def histRising = AbsValue(histogram_) > AbsValue(histogram_[1]);
+
+def expansionTrigger =
+    if expansionStrictness == expansionStrictness."Strict"
+    then slopeRising and histRising
+    else slopeRising or histRising;
+
+def rawExpansionSignal = inCompressionState[1] and !isCompressedBar and expansionTrigger;
+
+# First expansion bar only — prevent repeats until new compression cycle
+def expansionFired = CompoundValue(1,
+    if rawExpansionSignal and !expansionFired[1] then yes
+    else if inCompressionState then no
+    else expansionFired[1], no);
+
+def expansionSignal = rawExpansionSignal and !expansionFired[1];
+
+# Compression entry detection (first bar reaching minBars)
+def compressionEntry = compBarCount == compressionMinBars;
+
+# Directional expansion
+def bullishExpansion = expansionSignal and fastLine > 0;
+def bearishExpansion = expansionSignal and fastLine < 0;
+
+# =============================================================================
+# SECTION 20: EXHAUSTION ENGINE
+# =============================================================================
+# Detects when oscillator is in extreme zone but momentum quality deteriorates.
+# Deterioration: weakening histogram, weakening slope, lower impulse magnitude,
+# or price-oscillator divergence (price pressing, oscillator fading).
+
+def inBullExtremeZone = fastLine > exhaustionThreshold;
+def inBearExtremeZone = fastLine < -exhaustionThreshold;
+
+# Deterioration metrics
+def histWeakening = AbsValue(histogram_) < AbsValue(histogram_[1]);
+def slopeWeakening = AbsValue(oscSlope) < AbsValue(oscSlope[1]);
+def impulseWeakening = AbsValue(impulse_) < AbsValue(impulse_[1]);
+
+# Price still pressing in same direction
+def priceStillUp = close > close[1];
+def priceStillDown = close < close[1];
+
+# Combined deterioration score (0 to 4)
+def deterioration = (if histWeakening then 1 else 0) +
+                    (if slopeWeakening then 1 else 0) +
+                    (if impulseWeakening then 1 else 0) +
+                    (if (inBullExtremeZone and priceStillUp and oscSlope < 0) or
+                        (inBearExtremeZone and priceStillDown and oscSlope > 0)
+                     then 1 else 0);
+
+# Early exhaustion: any 2 deterioration signals while in extreme zone
+# Confirmed exhaustion: sustained deterioration for N bars
+def earlyBullExh = inBullExtremeZone and deterioration >= 2;
+def earlyBearExh = inBearExtremeZone and deterioration >= 2;
+
+def bullExhBarCount = CompoundValue(1,
+    if inBullExtremeZone and deterioration >= 2 then bullExhBarCount[1] + 1 else 0, 0);
+def bearExhBarCount = CompoundValue(1,
+    if inBearExtremeZone and deterioration >= 2 then bearExhBarCount[1] + 1 else 0, 0);
+
+def confirmedBullExh = bullExhBarCount >= exhaustionConfirmBars;
+def confirmedBearExh = bearExhBarCount >= exhaustionConfirmBars;
+
+def bullExhaustion = if exhaustionMode == exhaustionMode."Early" then earlyBullExh
+                     else confirmedBullExh;
+def bearExhaustion = if exhaustionMode == exhaustionMode."Early" then earlyBearExh
+                     else confirmedBearExh;
+
+# State transition detection for alerts (fire only on first bar of exhaustion)
+def bullExhTransition = bullExhaustion and !bullExhaustion[1];
+def bearExhTransition = bearExhaustion and !bearExhaustion[1];
+
+# =============================================================================
+# SECTION 21: DIVERGENCE ENGINE
+# =============================================================================
+# Detects regular and hidden divergence between price pivots and oscillator pivots.
+# Pivots confirmed after rightStrength bars.
+# NOTE: Signals appear rightStrength bars late — unavoidable without repainting.
+
+def priceH = high;
+def priceL = low;
+def oscVal = fastLine;
+
+# Pivot high detection (confirmed)
+def isPivotHigh = fold phL = 1 to divPivotLeftStrength + 1
+    with phAcc = yes
+    do phAcc and GetValue(priceH, divPivotRightStrength) >= GetValue(priceH, divPivotRightStrength + phL);
+def isPivotHighR = fold phR = 0 to divPivotRightStrength
+    with phAccR = isPivotHigh
+    do phAccR and GetValue(priceH, divPivotRightStrength) >= GetValue(priceH, phR);
+def pivotHighConfirmed = isPivotHighR;
+
+# Pivot low detection (confirmed)
+def isPivotLow = fold plL = 1 to divPivotLeftStrength + 1
+    with plAcc = yes
+    do plAcc and GetValue(priceL, divPivotRightStrength) <= GetValue(priceL, divPivotRightStrength + plL);
+def isPivotLowR = fold plR = 0 to divPivotRightStrength
+    with plAccR = isPivotLow
+    do plAccR and GetValue(priceL, divPivotRightStrength) <= GetValue(priceL, plR);
+def pivotLowConfirmed = isPivotLowR;
+
+# Track last two pivot highs (price and oscillator values at those pivots)
+def lastPivotHighPrice = CompoundValue(1,
+    if pivotHighConfirmed then priceH[divPivotRightStrength] else lastPivotHighPrice[1], 0);
+def lastPivotHighOsc = CompoundValue(1,
+    if pivotHighConfirmed then oscVal[divPivotRightStrength] else lastPivotHighOsc[1], 0);
+def lastPivotHighBar = CompoundValue(1,
+    if pivotHighConfirmed then BarNumber() else lastPivotHighBar[1], 0);
+
+def prevPivotHighPrice = CompoundValue(1,
+    if pivotHighConfirmed then lastPivotHighPrice[1] else prevPivotHighPrice[1], 0);
+def prevPivotHighOsc = CompoundValue(1,
+    if pivotHighConfirmed then lastPivotHighOsc[1] else prevPivotHighOsc[1], 0);
+def prevPivotHighBar = CompoundValue(1,
+    if pivotHighConfirmed then lastPivotHighBar[1] else prevPivotHighBar[1], 0);
+
+# Track last two pivot lows
+def lastPivotLowPrice = CompoundValue(1,
+    if pivotLowConfirmed then priceL[divPivotRightStrength] else lastPivotLowPrice[1], 0);
+def lastPivotLowOsc = CompoundValue(1,
+    if pivotLowConfirmed then oscVal[divPivotRightStrength] else lastPivotLowOsc[1], 0);
+def lastPivotLowBar = CompoundValue(1,
+    if pivotLowConfirmed then BarNumber() else lastPivotLowBar[1], 0);
+
+def prevPivotLowPrice = CompoundValue(1,
+    if pivotLowConfirmed then lastPivotLowPrice[1] else prevPivotLowPrice[1], 0);
+def prevPivotLowOsc = CompoundValue(1,
+    if pivotLowConfirmed then lastPivotLowOsc[1] else prevPivotLowOsc[1], 0);
+def prevPivotLowBar = CompoundValue(1,
+    if pivotLowConfirmed then lastPivotLowBar[1] else prevPivotLowBar[1], 0);
+
+# Spacing and separation checks
+def highSpacingOK = (lastPivotHighBar - prevPivotHighBar) > 0 and
+                    (lastPivotHighBar - prevPivotHighBar) <= divMaxSpacing;
+def lowSpacingOK  = (lastPivotLowBar - prevPivotLowBar) > 0 and
+                    (lastPivotLowBar - prevPivotLowBar) <= divMaxSpacing;
+
+def highOscSepOK = AbsValue(lastPivotHighOsc - prevPivotHighOsc) >= divMinOscSeparation;
+def lowOscSepOK  = AbsValue(lastPivotLowOsc - prevPivotLowOsc) >= divMinOscSeparation;
+
+def highExtremeOK = if divRequireExtremeZone then
+                        AbsValue(lastPivotHighOsc) >= divExtremeLevel
+                    else yes;
+def lowExtremeOK  = if divRequireExtremeZone then
+                        AbsValue(lastPivotLowOsc) >= divExtremeLevel
+                    else yes;
+
+# Regular Bearish Divergence: price higher high, oscillator lower high
+def regBearDiv = pivotHighConfirmed and highSpacingOK and highOscSepOK and highExtremeOK and
+    lastPivotHighPrice > prevPivotHighPrice and prevPivotHighPrice > 0 and
+    lastPivotHighOsc < prevPivotHighOsc;
+
+# Regular Bullish Divergence: price lower low, oscillator higher low
+def regBullDiv = pivotLowConfirmed and lowSpacingOK and lowOscSepOK and lowExtremeOK and
+    lastPivotLowPrice < prevPivotLowPrice and prevPivotLowPrice > 0 and
+    lastPivotLowOsc > prevPivotLowOsc;
+
+# Hidden Bullish Divergence: price higher low, oscillator lower low
+def hidBullDiv = pivotLowConfirmed and lowSpacingOK and lowOscSepOK and lowExtremeOK and
+    lastPivotLowPrice > prevPivotLowPrice and prevPivotLowPrice > 0 and
+    lastPivotLowOsc < prevPivotLowOsc;
+
+# Hidden Bearish Divergence: price lower high, oscillator higher high
+def hidBearDiv = pivotHighConfirmed and highSpacingOK and highOscSepOK and highExtremeOK and
+    lastPivotHighPrice < prevPivotHighPrice and prevPivotHighPrice > 0 and
+    lastPivotHighOsc > prevPivotHighOsc;
+
+# =============================================================================
+# SECTION 22: CUMULATIVE PRESSURE MODULE
+# =============================================================================
+# Rolling or session-aware cumulative sum of base pressure vs price progress.
+
+def isNewDay = GetYYYYMMDD() != GetYYYYMMDD()[1];
+
+def cumPressure = CompoundValue(1,
+    if cumulativePressureMode == cumulativePressureMode."Session" and isNewDay
+    then basePressure
+    else cumPressure[1] + basePressure, 0);
+
+# Rolling window version — sum over last N bars
+def rollingCumPressure = Sum(basePressure, cumulativeRollingLength);
+
+def activeCumPressure = if cumulativePressureMode == cumulativePressureMode."Rolling"
+                        then rollingCumPressure
+                        else cumPressure;
+
+# Price progress (normalized change over same window)
+def priceProgress = if cumulativePressureMode == cumulativePressureMode."Rolling"
+    then close - close[cumulativeRollingLength]
+    else if isNewDay then 0
+    else close - open;
+
+def avgAbsCum = Average(AbsValue(activeCumPressure), normLength);
+def safeAvgAbsCum = if avgAbsCum == 0 then Double.NaN else avgAbsCum;
+def cumNorm = if IsNaN(safeAvgAbsCum) then 0 else activeCumPressure / safeAvgAbsCum;
+
+def avgAbsProgress = Average(AbsValue(priceProgress), normLength);
+def safeAvgAbsProgress = if avgAbsProgress == 0 then Double.NaN else avgAbsProgress;
+def progressNorm = if IsNaN(safeAvgAbsProgress) then 0 else priceProgress / safeAvgAbsProgress;
+
+# Imbalance states
+# 1 = price advancing, weak cumulative pressure
+# 2 = price declining, weak cumulative pressure
+# 3 = price flat, pressure accumulating
+# 4 = price diverging from cumulative pressure trend
+def cumImbalance;
+if progressNorm > 0.5 and cumNorm < 0.3 {
+    cumImbalance = 1;
+} else if progressNorm < -0.5 and cumNorm > -0.3 {
+    cumImbalance = 2;
+} else if AbsValue(progressNorm) < 0.3 and AbsValue(cumNorm) > 0.5 {
+    cumImbalance = 3;
+} else if (progressNorm > 0 and cumNorm < 0) or (progressNorm < 0 and cumNorm > 0) {
+    cumImbalance = 4;
+} else {
+    cumImbalance = 0;
+}
+
+# =============================================================================
+# SECTION 23: MULTI-TIME-HORIZON ALIGNMENT
+# =============================================================================
+# Short, medium, long horizon versions via different smoothing lengths.
+# Alignment / disagreement classification.
+
+def shortHorizon = MovingAverage(oscSmoothType, normalized, shortHorizonLength);
+def medHorizon = MovingAverage(oscSmoothType, normalized, mediumHorizonLength);
+def longHorizon = MovingAverage(oscSmoothType, normalized, longHorizonLength);
+
+def shortSlope = shortHorizon - shortHorizon[1];
+def medSlope = medHorizon - medHorizon[1];
+def longSlope = longHorizon - longHorizon[1];
+
+# Alignment codes:
+# 1 = full bullish alignment (all positive & rising)
+# 2 = full bearish alignment (all negative & falling)
+# 3 = short-term reversal against long-term pressure
+# 4 = long-term drift with short-term compression
+# 0 = mixed / no clear alignment
+def horizonAlignment;
+if shortHorizon > 0 and medHorizon > 0 and longHorizon > 0 and
+   shortSlope > 0 and medSlope > 0 and longSlope > 0 {
+    horizonAlignment = 1;  # Full bullish
+} else if shortHorizon < 0 and medHorizon < 0 and longHorizon < 0 and
+          shortSlope < 0 and medSlope < 0 and longSlope < 0 {
+    horizonAlignment = 2;  # Full bearish
+} else if (shortSlope < 0 and longSlope > 0 and longHorizon > 0) or
+          (shortSlope > 0 and longSlope < 0 and longHorizon < 0) {
+    horizonAlignment = 3;  # Short-term reversal vs long-term
+} else if AbsValue(shortHorizon) < compressionThreshold and AbsValue(longSlope) > 0 {
+    horizonAlignment = 4;  # Long drift, short compression
+} else {
+    horizonAlignment = 0;  # Mixed
+}
+
+# =============================================================================
+# SECTION 24: COMPOSITE CONFIDENCE SCORE
+# =============================================================================
+# Weighted combination of regime quality, divergence presence, exhaustion,
+# compression/expansion status, and horizon alignment. Range: ~[-100, +100].
+
+def totalConfWeight = confWeightRegime + confWeightDivergence + confWeightExhaustion +
+                      confWeightCompression + confWeightAlignment;
+def safeConfWeight = if totalConfWeight == 0 then Double.NaN else totalConfWeight;
+
+# Regime component: +1 for bullish regimes, -1 for bearish, 0 for neutral
+def regimeScore = if regime == 1 then 1.0
+    else if regime == 2 then 0.7
+    else if regime == 3 then 0.3
+    else if regime == 5 then -1.0
+    else if regime == 6 then -0.7
+    else if regime == 7 then -0.3
+    else 0;
+
+# Divergence component
+def divScore = (if regBullDiv then 1.0 else 0) +
+               (if hidBullDiv then 0.5 else 0) +
+               (if regBearDiv then -1.0 else 0) +
+               (if hidBearDiv then -0.5 else 0);
+
+# Exhaustion component (negative for matching direction — warning signal)
+def exhScore = (if bullExhaustion then -0.7 else 0) +
+               (if bearExhaustion then 0.7 else 0);
+
+# Compression/expansion component
+def compScore = if bullishExpansion then 1.0
+    else if bearishExpansion then -1.0
+    else if inCompressionState then 0
+    else 0;
+
+# Alignment component
+def alignScore = if horizonAlignment == 1 then 1.0
+    else if horizonAlignment == 2 then -1.0
+    else if horizonAlignment == 3 then -0.3
+    else if horizonAlignment == 4 then 0.2
+    else 0;
+
+def confidenceRaw = if IsNaN(safeConfWeight) then 0 else
+    (confWeightRegime * regimeScore +
+     confWeightDivergence * divScore +
+     confWeightExhaustion * exhScore +
+     confWeightCompression * compScore +
+     confWeightAlignment * alignScore) / safeConfWeight * 100;
+
+def confidence = Max(-100, Min(100, confidenceRaw));
+
+# =============================================================================
+# SECTION 25: REGIME ENGINE — CUMULATIVE IMBALANCE FEEDBACK
+# =============================================================================
+# Adjust regime when cumulative imbalance signals significant divergence.
+# If cumImbalance == 4 (price diverging from cumulative pressure), override
+# to transition/unstable if in strict mode.
+
+def finalRegime = if regimeStrictMode and cumImbalance == 4 then 8 else regime;
+
+# =============================================================================
+# SECTION 26: PLOTS — OSCILLATOR FRAMEWORK
+# =============================================================================
+
+plot FastPlot = if showFastLine then fastLine else Double.NaN;
+FastPlot.SetDefaultColor(Color.CYAN);
+FastPlot.SetLineWeight(2);
+FastPlot.AssignValueColor(if fastLine >= 0 then Color.CYAN else Color.MAGENTA);
+
+plot SlowPlot = if showSlowLine then slowLine_ else Double.NaN;
+SlowPlot.SetDefaultColor(Color.GRAY);
+SlowPlot.SetLineWeight(1);
+
+plot SignalPlot = if showSignalLine then signalLine_ else Double.NaN;
+SignalPlot.SetDefaultColor(Color.YELLOW);
+SignalPlot.SetLineWeight(1);
+SignalPlot.SetStyle(Curve.SHORT_DASH);
+
+plot Hist = if showHistogram then histogram_ else Double.NaN;
+Hist.SetPaintingStrategy(PaintingStrategy.HISTOGRAM);
+Hist.SetLineWeight(3);
+# Histogram color: strengthening = bright, weakening = dim
+Hist.AssignValueColor(
+    if histogram_ >= 0 and histogram_ >= histogram_[1] then Color.GREEN
+    else if histogram_ >= 0 then Color.DARK_GREEN
+    else if histogram_ < 0 and histogram_ <= histogram_[1] then Color.RED
+    else Color.DARK_RED);
+
+plot ZeroLine = if showZeroLine then 0 else Double.NaN;
+ZeroLine.SetDefaultColor(Color.GRAY);
+ZeroLine.SetStyle(Curve.SHORT_DASH);
+ZeroLine.SetLineWeight(1);
+
+plot ImpulsePlot = if showImpulseLine then impulse_ else Double.NaN;
+ImpulsePlot.SetDefaultColor(Color.ORANGE);
+ImpulsePlot.SetLineWeight(1);
+
+plot CurvaturePlot = if showCurvatureLine then curvature_ else Double.NaN;
+CurvaturePlot.SetDefaultColor(Color.VIOLET);
+CurvaturePlot.SetLineWeight(1);
+CurvaturePlot.SetStyle(Curve.MEDIUM_DASH);
+
+plot ConfidencePlot = if showConfidencePlot then confidence else Double.NaN;
+ConfidencePlot.SetDefaultColor(Color.WHITE);
+ConfidencePlot.SetLineWeight(1);
+ConfidencePlot.SetStyle(Curve.LONG_DASH);
+
+# Extreme bands
+plot UpperExtreme = if showExtremeBands then exhaustionThreshold else Double.NaN;
+UpperExtreme.SetDefaultColor(Color.DARK_RED);
+UpperExtreme.SetStyle(Curve.SHORT_DASH);
+
+plot LowerExtreme = if showExtremeBands then -exhaustionThreshold else Double.NaN;
+LowerExtreme.SetDefaultColor(Color.DARK_GREEN);
+LowerExtreme.SetStyle(Curve.SHORT_DASH);
+
+# =============================================================================
+# SECTION 27: PLOTS — DIVERGENCE MARKERS
+# =============================================================================
+
+plot RegBullDivMarker = if showDivergenceMarkers and regBullDiv then fastLine else Double.NaN;
+RegBullDivMarker.SetPaintingStrategy(PaintingStrategy.ARROW_UP);
+RegBullDivMarker.SetDefaultColor(Color.GREEN);
+RegBullDivMarker.SetLineWeight(3);
+
+plot RegBearDivMarker = if showDivergenceMarkers and regBearDiv then fastLine else Double.NaN;
+RegBearDivMarker.SetPaintingStrategy(PaintingStrategy.ARROW_DOWN);
+RegBearDivMarker.SetDefaultColor(Color.RED);
+RegBearDivMarker.SetLineWeight(3);
+
+plot HidBullDivMarker = if showDivergenceMarkers and hidBullDiv then fastLine else Double.NaN;
+HidBullDivMarker.SetPaintingStrategy(PaintingStrategy.BOOLEAN_WEDGE_UP);
+HidBullDivMarker.SetDefaultColor(Color.LIGHT_GREEN);
+HidBullDivMarker.SetLineWeight(2);
+
+plot HidBearDivMarker = if showDivergenceMarkers and hidBearDiv then fastLine else Double.NaN;
+HidBearDivMarker.SetPaintingStrategy(PaintingStrategy.BOOLEAN_WEDGE_DOWN);
+HidBearDivMarker.SetDefaultColor(Color.LIGHT_RED);
+HidBearDivMarker.SetLineWeight(2);
+
+# =============================================================================
+# SECTION 28: PLOTS — COMPRESSION & EXPANSION MARKERS
+# =============================================================================
+
+plot CompressionEntryMarker = if showCompressionMarkers and compressionEntry then 0 else Double.NaN;
+CompressionEntryMarker.SetPaintingStrategy(PaintingStrategy.SQUARES);
+CompressionEntryMarker.SetDefaultColor(Color.YELLOW);
+CompressionEntryMarker.SetLineWeight(3);
+
+plot ExpansionBullMarker = if showCompressionMarkers and bullishExpansion then fastLine else Double.NaN;
+ExpansionBullMarker.SetPaintingStrategy(PaintingStrategy.ARROW_UP);
+ExpansionBullMarker.SetDefaultColor(Color.LIME);
+ExpansionBullMarker.SetLineWeight(4);
+
+plot ExpansionBearMarker = if showCompressionMarkers and bearishExpansion then fastLine else Double.NaN;
+ExpansionBearMarker.SetPaintingStrategy(PaintingStrategy.ARROW_DOWN);
+ExpansionBearMarker.SetDefaultColor(Color.DARK_RED);
+ExpansionBearMarker.SetLineWeight(4);
+
+# =============================================================================
+# SECTION 29: PLOTS — EXHAUSTION MARKERS
+# =============================================================================
+
+plot BullExhMarker = if showExhaustionMarkers and bullExhTransition then fastLine else Double.NaN;
+BullExhMarker.SetPaintingStrategy(PaintingStrategy.TRIANGLES);
+BullExhMarker.SetDefaultColor(Color.DARK_ORANGE);
+BullExhMarker.SetLineWeight(3);
+
+plot BearExhMarker = if showExhaustionMarkers and bearExhTransition then fastLine else Double.NaN;
+BearExhMarker.SetPaintingStrategy(PaintingStrategy.TRIANGLES);
+BearExhMarker.SetDefaultColor(Color.PLUM);
+BearExhMarker.SetLineWeight(3);
+
+# =============================================================================
+# SECTION 30: REGIME LABELS & BACKGROUND
+# =============================================================================
+
+AddLabel(showRegimeLabels,
+    if finalRegime == 1 then "BULL EXPANSION"
+    else if finalRegime == 2 then "BULL CONTINUATION"
+    else if finalRegime == 3 then "BULL EXHAUSTION"
+    else if finalRegime == 4 then "COMPRESSED"
+    else if finalRegime == 5 then "BEAR EXPANSION"
+    else if finalRegime == 6 then "BEAR CONTINUATION"
+    else if finalRegime == 7 then "BEAR EXHAUSTION"
+    else "TRANSITION",
+    if finalRegime == 1 then Color.GREEN
+    else if finalRegime == 2 then Color.DARK_GREEN
+    else if finalRegime == 3 then Color.DARK_ORANGE
+    else if finalRegime == 4 then Color.YELLOW
+    else if finalRegime == 5 then Color.RED
+    else if finalRegime == 6 then Color.DARK_RED
+    else if finalRegime == 7 then Color.PLUM
+    else Color.GRAY);
+
+# Cumulative imbalance label
+AddLabel(showRegimeLabels and cumImbalance > 0,
+    if cumImbalance == 1 then "CUM: Price Up / Weak Pressure"
+    else if cumImbalance == 2 then "CUM: Price Down / Weak Pressure"
+    else if cumImbalance == 3 then "CUM: Flat Price / Pressure Building"
+    else "CUM: Price-Pressure Diverging",
+    if cumImbalance == 4 then Color.ORANGE else Color.LIGHT_GRAY);
+
+# Horizon alignment label
+AddLabel(showRegimeLabels,
+    if horizonAlignment == 1 then "ALIGN: Full Bull"
+    else if horizonAlignment == 2 then "ALIGN: Full Bear"
+    else if horizonAlignment == 3 then "ALIGN: Short Reversal"
+    else if horizonAlignment == 4 then "ALIGN: Long Drift"
+    else "ALIGN: Mixed",
+    if horizonAlignment == 1 then Color.GREEN
+    else if horizonAlignment == 2 then Color.RED
+    else Color.GRAY);
+
+# Confidence label
+AddLabel(showConfidencePlot, "Conf: " + Round(confidence, 0),
+    if confidence > 30 then Color.GREEN
+    else if confidence < -30 then Color.RED
+    else Color.YELLOW);
+
+# Regime background coloring
+AssignBackgroundColor(
+    if !showRegimeBackground then Color.CURRENT
+    else if finalRegime == 1 then CreateColor(0, 40, 0)
+    else if finalRegime == 2 then CreateColor(0, 25, 0)
+    else if finalRegime == 3 then CreateColor(40, 25, 0)
+    else if finalRegime == 4 then CreateColor(30, 30, 0)
+    else if finalRegime == 5 then CreateColor(40, 0, 0)
+    else if finalRegime == 6 then CreateColor(25, 0, 0)
+    else if finalRegime == 7 then CreateColor(25, 0, 25)
+    else CreateColor(20, 20, 20));
+
+# =============================================================================
+# SECTION 31: ALERTS — STATE TRANSITION ONLY
+# =============================================================================
+
+# Track previous states for transition detection
+def prevRegime = finalRegime[1];
+def prevCompState = inCompressionState[1];
+def prevAlignment = horizonAlignment[1];
+
+# Bullish expansion alert
+Alert(alertsEnabled and alertBullishExpansion and bullishExpansion,
+    "AVTO: Bullish Expansion Breakout", Alert.BAR, Sound.Bell);
+
+# Bearish expansion alert
+Alert(alertsEnabled and alertBearishExpansion and bearishExpansion,
+    "AVTO: Bearish Expansion Breakout", Alert.BAR, Sound.Bell);
+
+# Compression entry alert
+Alert(alertsEnabled and alertCompressionEntry and compressionEntry,
+    "AVTO: Entered Compression", Alert.BAR, Sound.Ding);
+
+# Compression breakout alert (any directional expansion)
+Alert(alertsEnabled and alertCompressionBreakout and expansionSignal,
+    "AVTO: Compression Breakout", Alert.BAR, Sound.Ring);
+
+# Regular bullish divergence alert
+Alert(alertsEnabled and alertBullishDivergence and regBullDiv,
+    "AVTO: Regular Bullish Divergence", Alert.BAR, Sound.Chimes);
+
+# Regular bearish divergence alert
+Alert(alertsEnabled and alertBearishDivergence and regBearDiv,
+    "AVTO: Regular Bearish Divergence", Alert.BAR, Sound.Chimes);
+
+# Hidden bullish divergence alert
+Alert(alertsEnabled and alertHiddenBullishDiv and hidBullDiv,
+    "AVTO: Hidden Bullish Divergence", Alert.BAR, Sound.Ding);
+
+# Hidden bearish divergence alert
+Alert(alertsEnabled and alertHiddenBearishDiv and hidBearDiv,
+    "AVTO: Hidden Bearish Divergence", Alert.BAR, Sound.Ding);
+
+# Bullish exhaustion alert
+Alert(alertsEnabled and alertBullishExhaustion and bullExhTransition,
+    "AVTO: Bullish Exhaustion Detected", Alert.BAR, Sound.Ring);
+
+# Bearish exhaustion alert
+Alert(alertsEnabled and alertBearishExhaustion and bearExhTransition,
+    "AVTO: Bearish Exhaustion Detected", Alert.BAR, Sound.Ring);
+
+# Full bullish alignment alert (transition only)
+Alert(alertsEnabled and alertFullBullishAlignment and
+    horizonAlignment == 1 and prevAlignment != 1,
+    "AVTO: Full Bullish Alignment", Alert.BAR, Sound.Bell);
+
+# Full bearish alignment alert (transition only)
+Alert(alertsEnabled and alertFullBearishAlignment and
+    horizonAlignment == 2 and prevAlignment != 2,
+    "AVTO: Full Bearish Alignment", Alert.BAR, Sound.Bell);
+
+# =============================================================================
+# END OF STUDY
+# =============================================================================
