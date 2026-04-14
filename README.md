@@ -1,4 +1,4 @@
-# thinkscript_bot
+# thinkscript_agent
 
 A prompt-orchestrated ThinkScript Copilot framework that uses agents, instructions, prompts, and reusable skills to support **code generation**, **explanation of code**, **debugging**, **validation**, and **strategy conversion** in the Thinkscript language.
 
