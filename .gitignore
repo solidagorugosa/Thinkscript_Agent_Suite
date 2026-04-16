@@ -8,3 +8,7 @@ venv/
 *.bak
 *.log
 .vs/
+
+# Override global gitignore – ship editor settings with the repo
+!.vscode/
+!.vscode/settings.json
