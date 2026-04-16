@@ -1,0 +1,34 @@
+name: validate-generated-artifacts
+
+on:
+  pull_request:
+  push:
+    branches: [ main ]
+
+jobs:
+  validate:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Build manifest
+        shell: pwsh
+        run: |
+          python .\scripts\build_thinkscript_manifest.py `
+            --doc ".\.github\skills\thinkscript-authoring\references\Thinkscript-Documentation-Scrape\thinkscript_documentation_cleaned.md" `
+            --out ".\schemas\thinkscript_manifest.json"
+
+      - name: Validate artifacts folder (if present)
+        shell: pwsh
+        run: |
+          if (Test-Path ".\artifacts") {
+            Get-ChildItem .\artifacts -File -Filter *.md | ForEach-Object {
+              .\scripts\validate-thinkscript-output.ps1 -Path $_.FullName -TaskType generate -Mode fail
+            }
+          } else {
+            Write-Host "No artifacts folder found. Skipping."
+          }

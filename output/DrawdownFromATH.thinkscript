@@ -1,0 +1,37 @@
+declare lower;
+
+input peakSource = {default HIGH, OPEN, LOW, CLOSE};
+input priceSource = {default CLOSE, OPEN, HIGH, LOW};
+
+def peakPrice = if peakSource == peakSource.HIGH then high
+    else if peakSource == peakSource.OPEN then open
+    else if peakSource == peakSource.LOW then low
+    else close;
+
+def currentPrice = if priceSource == priceSource.CLOSE then close
+    else if priceSource == priceSource.OPEN then open
+    else if priceSource == priceSource.HIGH then high
+    else low;
+
+def allTimeHigh = CompoundValue(1, Max(peakPrice, allTimeHigh[1]), peakPrice);
+def drawdownPercent = ((currentPrice - allTimeHigh) / allTimeHigh) * 100;
+
+plot Drawdown = drawdownPercent;
+plot ZeroLine = 0;
+
+Drawdown.SetDefaultColor(Color.RED);
+Drawdown.SetLineWeight(2);
+Drawdown.AssignValueColor(
+    if drawdownPercent > -5 then Color.YELLOW
+    else if drawdownPercent > -10 then Color.ORANGE
+    else if drawdownPercent > -20 then Color.DARK_ORANGE
+    else Color.RED
+);
+
+ZeroLine.SetDefaultColor(Color.GRAY);
+ZeroLine.SetStyle(Curve.LONG_DASH);
+
+def maxDrawdown = LowestAll(drawdownPercent);
+AddLabel(yes, "Current Drawdown: " + Round(drawdownPercent, 2) + "%",
+    if drawdownPercent > -5 then Color.YELLOW else Color.RED);
+AddLabel(yes, "Max Drawdown: " + Round(maxDrawdown, 2) + "%", Color.DARK_RED);

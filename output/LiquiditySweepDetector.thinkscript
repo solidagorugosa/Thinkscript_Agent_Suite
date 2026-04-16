@@ -1,0 +1,83 @@
+# Liquidity Sweep Detector
+# Marks the first bar each session where price sweeps above the prior
+# day's high or below its low and closes back within the range.
+# Designed for intraday charts.
+
+declare upper;
+declare hide_on_daily;
+
+# --- Inputs ---
+input sessionOpen = 0930;
+input sessionClose = 1600;
+input showPriorLevels = yes;
+
+# --- Session Detection ---
+def newDay = GetYYYYMMDD() != GetYYYYMMDD()[1];
+def inRTH = SecondsFromTime(sessionOpen) >= 0 and SecondsTillTime(sessionClose) > 0;
+
+# --- Prior Day High / Low ---
+def dayHi;
+def dayLo;
+def priorHi;
+def priorLo;
+
+if newDay {
+    priorHi = dayHi[1];
+    priorLo = dayLo[1];
+    dayHi = high;
+    dayLo = low;
+} else {
+    priorHi = priorHi[1];
+    priorLo = priorLo[1];
+    dayHi = Max(dayHi[1], high);
+    dayLo = Min(dayLo[1], low);
+}
+
+# --- Reference Level Lines ---
+plot PriorHigh = if showPriorLevels and inRTH and !IsNaN(priorHi) then priorHi else Double.NaN;
+plot PriorLow  = if showPriorLevels and inRTH and !IsNaN(priorLo) then priorLo else Double.NaN;
+
+PriorHigh.SetDefaultColor(Color.CYAN);
+PriorHigh.SetStyle(Curve.SHORT_DASH);
+PriorHigh.SetLineWeight(2);
+
+PriorLow.SetDefaultColor(Color.MAGENTA);
+PriorLow.SetStyle(Curve.SHORT_DASH);
+PriorLow.SetLineWeight(2);
+
+# --- Raw Sweep Conditions ---
+def validHi = !IsNaN(priorHi) and priorHi > 0;
+def validLo = !IsNaN(priorLo) and priorLo > 0;
+
+def rawHiSweep = inRTH and validHi and high > priorHi and close <= priorHi;
+def rawLoSweep = inRTH and validLo and low < priorLo and close >= priorLo;
+
+# --- Per-Session First-Only State ---
+def hiSwept;
+def loSwept;
+
+if newDay {
+    hiSwept = rawHiSweep;
+    loSwept = rawLoSweep;
+} else {
+    hiSwept = hiSwept[1] or rawHiSweep;
+    loSwept = loSwept[1] or rawLoSweep;
+}
+
+def firstHiSweep = rawHiSweep and (if newDay then 1 else !hiSwept[1]);
+def firstLoSweep = rawLoSweep and (if newDay then 1 else !loSwept[1]);
+
+# --- Arrow Plots ---
+plot SweepDown = if firstHiSweep then high else Double.NaN;
+SweepDown.SetPaintingStrategy(PaintingStrategy.ARROW_DOWN);
+SweepDown.SetDefaultColor(Color.RED);
+SweepDown.SetLineWeight(3);
+
+plot SweepUp = if firstLoSweep then low else Double.NaN;
+SweepUp.SetPaintingStrategy(PaintingStrategy.ARROW_UP);
+SweepUp.SetDefaultColor(Color.GREEN);
+SweepUp.SetLineWeight(3);
+
+# --- Status Labels ---
+AddLabel(yes, "Hi Swept: " + (if hiSwept then "Yes" else "No"), if hiSwept then Color.RED else Color.GRAY);
+AddLabel(yes, "Lo Swept: " + (if loSwept then "Yes" else "No"), if loSwept then Color.GREEN else Color.GRAY);
